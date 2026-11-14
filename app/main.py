@@ -11,10 +11,11 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import asyncpg
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import config, publication
 from .db import close_pool, get_pool, init_pool, init_schema
 from .models import (
     ApplicationsImport,
@@ -22,9 +23,15 @@ from .models import (
     BatchResponse,
     CreditEventsImport,
     ImportAccepted,
+    PublicationCreateRequest,
+    PublicationPage,
+    PublicationResponse,
+    PublicationRowOut,
+    PublicationSummary,
     ResultsPage,
     ResultRow,
 )
+from .publication import SourceRecord, aggregate
 from .worker import Worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -269,6 +276,12 @@ async def create_batch(payload: BatchCreateRequest) -> BatchResponse:
     ids = payload.application_ids
     if len(set(ids)) != len(ids):
         raise HTTPException(400, "duplicate application_ids in request")
+    if len(ids) > config.MAX_APPLICATIONS_PER_BATCH:
+        raise HTTPException(
+            400,
+            f"a batch covers at most {config.MAX_APPLICATIONS_PER_BATCH} applications, "
+            f"got {len(ids)}",
+        )
 
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -415,6 +428,264 @@ async def get_results(
     ]
     return ResultsPage(batch_id=batch_id, status="COMPLETED", limit=limit,
                        next_cursor=next_cursor, items=items)
+
+
+# --------------------------------------------------------------------------- #
+# Privacy-preserving income-distribution publications
+#
+# One published version per completed batch. Two API processes share the
+# database, so the "first successful submitter wins" rule is enforced inside a
+# single transaction with:
+#   1. a FOR UPDATE row lock on the batch (serialises same-batch submitters),
+#   2. a UNIQUE (batch_id) constraint as the hard backstop.
+# Any failure rolls the whole transaction back: no readable half result is
+# ever left behind. Re-submitting the same parameters returns the stored
+# original version.
+# --------------------------------------------------------------------------- #
+def _row_to_out(r) -> PublicationRowOut:
+    return PublicationRowOut(
+        period_kind=r["period_kind"],
+        period_start=r["period_start"],
+        period_end=r["period_end"],
+        bin_lower=r["bin_lower"],
+        bin_upper=r["bin_upper"],
+        application_count=r["application_count"],
+        distinct_customer_count=r["distinct_customer_count"],
+    )
+
+
+async def _load_publication(conn, batch_id: uuid.UUID) -> dict | None:
+    pub = await conn.fetchrow(
+        """SELECT publication_id, batch_id, k, bin_width, created_at,
+                  row_count, suppressed_application_count
+             FROM publications WHERE batch_id = $1""",
+        batch_id,
+    )
+    return dict(pub.items()) if pub else None
+
+
+async def _fetch_pub_rows(conn, publication_id: uuid.UUID) -> list[PublicationRowOut]:
+    rows = await conn.fetch(
+        """SELECT period_kind, period_start, period_end, bin_lower, bin_upper,
+                  application_count, distinct_customer_count
+             FROM publication_rows
+            WHERE publication_id = $1
+            ORDER BY row_seq""",
+        publication_id,
+    )
+    return [_row_to_out(r) for r in rows]
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/publications",
+    response_model=PublicationResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["publications"],
+    summary="发布收入分布（每批仅一版；并发下先成功提交者为准）",
+)
+async def create_publication(batch_id: uuid.UUID, payload: PublicationCreateRequest):
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Row lock serialises concurrent publications of the same batch.
+                batch = await conn.fetchrow(
+                    "SELECT status, total_items FROM batches "
+                    "WHERE batch_id = $1 FOR UPDATE",
+                    batch_id,
+                )
+                if not batch:
+                    raise HTTPException(404, "batch not found")
+                if batch["status"] != "COMPLETED":
+                    raise HTTPException(
+                        409,
+                        f"publication requires a COMPLETED batch; batch is {batch['status']}",
+                    )
+                if batch["total_items"] > config.MAX_APPLICATIONS_PER_BATCH:
+                    raise HTTPException(
+                        400,
+                        f"a published batch covers at most "
+                        f"{config.MAX_APPLICATIONS_PER_BATCH} applications; "
+                        f"this batch has {batch['total_items']}",
+                    )
+
+                existing = await _load_publication(conn, batch_id)
+                if existing is not None:
+                    # Single version rule. Same parameters => idempotent read of
+                    # the original; different parameters => conflict.
+                    if existing["k"] != payload.k or existing["bin_width"] != payload.bin_width:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "detail": "a publication with different parameters already "
+                                          "exists for this batch; only one version is allowed",
+                                "batch_id": str(batch_id),
+                                "existing_publication_id": str(existing["publication_id"]),
+                                "existing_k": existing["k"],
+                                "existing_bin_width": existing["bin_width"],
+                            },
+                        )
+                    rows = await _fetch_pub_rows(conn, existing["publication_id"])
+                    # Same parameters: idempotent read of the stored original.
+                    return JSONResponse(
+                        status_code=200,
+                        content=PublicationResponse(
+                            **existing, already_published=True, rows=rows,
+                        ).model_dump(mode="json"),
+                    )
+
+                # Build the aggregation from the immutable batch results. Only
+                # aggregate-safe columns leave the database; no ids are published.
+                result_rows = await conn.fetch(
+                    """SELECT customer_id, application_time, income
+                         FROM batch_results WHERE batch_id = $1""",
+                    batch_id,
+                )
+                records = [
+                    SourceRecord(
+                        customer_id=r["customer_id"],
+                        application_month=r["application_time"].date(),  # UTC date
+                        income=r["income"],
+                    )
+                    for r in result_rows
+                ]
+                result: publication.AggregationResult = aggregate(
+                    records, payload.k, payload.bin_width
+                )
+
+                publication_id = uuid.uuid4()
+                await conn.execute(
+                    """INSERT INTO publications
+                           (publication_id, batch_id, k, bin_width, row_count,
+                            suppressed_application_count)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    publication_id, batch_id, payload.k, payload.bin_width,
+                    len(result.rows), result.suppressed_application_count,
+                )
+                await conn.executemany(
+                    """INSERT INTO publication_rows
+                           (publication_id, row_seq, period_kind, period_start,
+                            period_end, bin_lower, bin_upper, application_count,
+                            distinct_customer_count)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+                    [
+                        (
+                            publication_id, seq, row.period_kind, row.period_start,
+                            row.period_end, row.bin_lower, row.bin_upper,
+                            row.application_count, row.distinct_customer_count,
+                        )
+                        for seq, row in enumerate(result.rows)
+                    ],
+                )
+                saved = await _load_publication(conn, batch_id)
+                out_rows = [
+                    PublicationRowOut(
+                        period_kind=row.period_kind,
+                        period_start=row.period_start,
+                        period_end=row.period_end,
+                        bin_lower=row.bin_lower,
+                        bin_upper=row.bin_upper,
+                        application_count=row.application_count,
+                        distinct_customer_count=row.distinct_customer_count,
+                    )
+                    for row in result.rows
+                ]
+                return PublicationResponse(
+                    **saved, already_published=False, rows=out_rows,
+                )
+    except asyncpg.UniqueViolationError:
+        # Hard backstop: a concurrent transaction committed first. Re-read and
+        # apply the same single-version / idempotent rules.
+        async with pool.acquire() as conn:
+            existing = await _load_publication(conn, batch_id)
+        if existing is None:  # pragma: no cover - constraint guarantees a row
+            raise HTTPException(500, "publication conflict but no stored version found")
+        if existing["k"] != payload.k or existing["bin_width"] != payload.bin_width:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "a publication with different parameters already exists for "
+                              "this batch; the concurrent request committed first",
+                    "batch_id": str(batch_id),
+                    "existing_publication_id": str(existing["publication_id"]),
+                    "existing_k": existing["k"],
+                    "existing_bin_width": existing["bin_width"],
+                },
+            )
+        async with pool.acquire() as conn:
+            rows = await _fetch_pub_rows(conn, existing["publication_id"])
+        return JSONResponse(
+            status_code=200,
+            content=PublicationResponse(
+                **existing, already_published=True, rows=rows,
+            ).model_dump(mode="json"),
+        )
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/publications",
+    response_model=PublicationPage,
+    tags=["publications"],
+    summary="分页查看已发布收入分布（keyset 分页，沿用结果分页方式）",
+)
+async def get_publication(
+    batch_id: uuid.UUID,
+    limit: int = Query(default=config.DEFAULT_PAGE_SIZE, ge=1, le=config.MAX_PAGE_SIZE),
+    cursor: str | None = Query(default=None, description="上一页返回的 next_cursor"),
+) -> PublicationPage:
+    after_seq = _decode_cursor(cursor) if cursor else -1
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        pub = await conn.fetchrow(
+            """SELECT publication_id, batch_id, k, bin_width, created_at,
+                      row_count, suppressed_application_count
+                 FROM publications WHERE batch_id = $1""",
+            batch_id,
+        )
+        if not pub:
+            raise HTTPException(404, "no publication exists for this batch")
+        rows = await conn.fetch(
+            """SELECT row_seq, period_kind, period_start, period_end, bin_lower,
+                      bin_upper, application_count, distinct_customer_count
+                 FROM publication_rows
+                WHERE publication_id = $1 AND row_seq > $2
+                ORDER BY row_seq
+                LIMIT $3""",
+            pub["publication_id"], after_seq, limit + 1,
+        )
+    next_cursor = None
+    if len(rows) > limit:
+        next_cursor = _encode_cursor(rows[limit - 1]["row_seq"])
+        rows = rows[:limit]
+    return PublicationPage(
+        publication_id=pub["publication_id"],
+        batch_id=pub["batch_id"],
+        k=pub["k"],
+        bin_width=pub["bin_width"],
+        created_at=pub["created_at"],
+        row_count=pub["row_count"],
+        suppressed_application_count=pub["suppressed_application_count"],
+        limit=limit,
+        next_cursor=next_cursor,
+        items=[_row_to_out(r) for r in rows],
+    )
+
+
+@app.get(
+    "/api/v1/publications",
+    response_model=list[PublicationSummary],
+    tags=["publications"],
+    summary="列出全部已发布收入分布汇总",
+)
+async def list_publications() -> list[PublicationSummary]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT publication_id, batch_id, k, bin_width, created_at,
+                      row_count, suppressed_application_count
+                 FROM publications ORDER BY created_at""",
+        )
+    return [PublicationSummary(**dict(r.items())) for r in rows]
 
 
 # --------------------------------------------------------------------------- #

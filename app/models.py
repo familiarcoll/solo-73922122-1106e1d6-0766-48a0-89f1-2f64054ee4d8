@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -101,3 +101,56 @@ class ImportAccepted(BaseModel):
     ingest_batch_id: uuid.UUID
     imported: int
     kind: str
+
+
+# --------------------------------------------------------------------------- #
+# Privacy-preserving income-distribution publications
+# --------------------------------------------------------------------------- #
+class PublicationCreateRequest(BaseModel):
+    k: int = Field(ge=2, le=5, description="每个发布行至少包含的去重客户数（2～5）")
+    bin_width: int = Field(ge=1, description="正整数收入分箱宽度，以零为边界")
+
+
+class PublicationRowOut(BaseModel):
+    period_kind: str            # MONTH | QUARTER | YEAR
+    period_start: date          # UTC 时间段首日（含）
+    period_end: date            # UTC 时间段末日的次日（不含）
+    bin_lower: int | None       # null = 空收入单独箱
+    bin_upper: int | None
+    application_count: int
+    distinct_customer_count: int
+
+
+class PublicationResponse(BaseModel):
+    publication_id: uuid.UUID
+    batch_id: uuid.UUID
+    k: int
+    bin_width: int
+    created_at: datetime
+    row_count: int
+    suppressed_application_count: int
+    already_published: bool     # True = 同参数重试读取的既有版本
+    rows: list[PublicationRowOut]
+
+
+class PublicationPage(BaseModel):
+    batch_id: uuid.UUID
+    publication_id: uuid.UUID
+    k: int
+    bin_width: int
+    created_at: datetime
+    row_count: int
+    suppressed_application_count: int
+    limit: int
+    next_cursor: str | None
+    items: list[PublicationRowOut]
+
+
+class PublicationSummary(BaseModel):
+    publication_id: uuid.UUID
+    batch_id: uuid.UUID
+    k: int
+    bin_width: int
+    created_at: datetime
+    row_count: int
+    suppressed_application_count: int

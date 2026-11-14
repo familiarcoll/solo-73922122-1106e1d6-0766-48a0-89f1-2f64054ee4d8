@@ -34,3 +34,6 @@ MAX_CHUNK_ATTEMPTS = int(os.getenv("MAX_CHUNK_ATTEMPTS", "5"))
 # Pagination.
 DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", "100"))
 MAX_PAGE_SIZE = int(os.getenv("MAX_PAGE_SIZE", "1000"))
+
+# A published training batch covers at most this many applications.
+MAX_APPLICATIONS_PER_BATCH = int(os.getenv("MAX_APPLICATIONS_PER_BATCH", "300"))

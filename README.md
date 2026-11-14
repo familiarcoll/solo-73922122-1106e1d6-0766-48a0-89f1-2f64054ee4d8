@@ -128,7 +128,67 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 脚本会生成 60 笔数据的大批次，重启非执行者确认批次不受干扰，再 `docker compose kill`
 执行者，验证存活进程在租约过期后接管并完成，最后断言无遗漏、无重复、来源完整。
 
-## 五、脚本与测试
+## 五、隐私收入分布发布（对外交付，不含单笔申请与客户身份）
+
+已完成（`COMPLETED`）的训练批次可发布一版 **k-匿名收入分布**。对外只输出聚合行：
+收入箱、UTC 时间段、申请数、去重客户数；任何 `application_id` / `customer_id` 都不会出现在发布载荷中。
+
+### 分箱规则
+
+- 入参 `k`（2～5，每行至少 k 位去重客户）与 `bin_width`（正整数收入分箱宽度）。
+- 以零为边界按整数宽度地板分箱：`bin = [floor(income/width)*width, +width)`，
+  因此 0 恒为箱边界；负数收入同样向负无穷归箱（如 width=1000 时 -1 落入 `[-1000, 0)`）。
+- 回填收入为空（`income IS NULL`）的申请进入 **单独的空收入箱**（`bin_lower/bin_upper = null`），
+  与有收入箱完全分开，独立参与同样的合并/抑制级联。
+
+### 时间段级联合并（每个收入箱独立进行）
+
+1. 先按有记录的 **UTC 申请月** 统计申请数与去重客户数；没有记录的月份不产生任何行。
+2. **月 → 季**：某季度内只要有一个有记录月份的去重客户数不足 k，该季度全部月份合并为一个季度段；
+   否则各月保持按月发布。
+3. **季 → 年**：合并后的季度若去重客户仍不足 k，则把该年全部季度（连同其余月份）合并为一个年度段。
+4. 全年合并后去重客户仍不足 k 的记录 **不予发布**（计入 `suppressed_application_count`）。
+
+由此天然保证：每个发布行 `distinct_customer_count >= k`；同一收入箱内发布时间段互不重叠
+（一笔申请只属于一个发布段或被抑制），不存在重复计数。时间段以半开区间表示
+（`period_start` 含、`period_end` 不含），月/季/年分别覆盖完整日历范围。
+
+### 单版本、并发与原子性
+
+- 每个批次至多 300 笔申请（建批与发布两处都会拦截），且 **只能发布一版**。
+- 两个 API 进程并发提交不同参数时，**先成功提交者为准**：单事务内对批次行 `FOR UPDATE` 加锁，
+  并以 `publications.batch_id` 的 `UNIQUE` 约束兜底；落败方收到 `409`，响应中注明已存在版本的参数。
+- 同参数重试是幂等读取：返回 `200` 与原 `publication_id`、原内容（`already_published=true`）。
+- 整个发布在一个数据库事务内完成；任何失败整体回滚，**不留可读取的半份结果**。
+- 发布结果沿用 keyset 分页（`limit` + `next_cursor`）。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/batches/{id}/publications` | 发布（首版 201；同参数重试 200；异参冲突 409） |
+| GET | `/api/v1/batches/{id}/publications?limit=&cursor=` | 分页查看已发布分布 |
+| GET | `/api/v1/publications` | 列出全部发布汇总 |
+
+```bash
+curl -X POST localhost:8001/api/v1/batches/$BID/publications \
+  -H 'Content-Type: application/json' -d '{"k":2,"bin_width":1000}'
+curl "localhost:8001/api/v1/batches/$BID/publications?limit=100"
+```
+
+### 测试
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/test_publication_aggregation.py` | 级联合并纯函数的 30 项单元测试（无需数据库） |
+| `scripts/test_publication_api.py` | 双进程端到端：单版本、并发 201/409、幂等重试、分页、300 上限、隐私字段 |
+
+```bash
+python3 scripts/test_publication_aggregation.py
+python3 scripts/test_publication_api.py http://127.0.0.1:8001 http://127.0.0.1:8002
+```
+
+## 六、脚本与测试
 
 | 脚本 | 作用 |
 |---|---|
@@ -138,6 +198,8 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 | `scripts/restart_demo.sh` | Docker 下的重启/故障转移演示 |
 | `scripts/lease_failover_test.py` | 不依赖 Docker 的租约接管测试（以 SQL 令租约过期精确模拟 SIGKILL 后的状态） |
 | `scripts/test_pit_sql.py` | 时点重建 SQL 的 10 项边界单元测试（修订/撤回/未来事件/并列/栅栏/空值） |
+| `scripts/test_publication_aggregation.py` | 收入分布级联合并纯函数的 30 项单元测试（无需数据库） |
+| `scripts/test_publication_api.py` | 发布 API 双进程端到端测试（单版本/并发冲突/幂等重试/分页/300 上限/隐私字段） |
 
 无 Docker 的本地验证方式（需要一个 PostgreSQL 并设置 `DATABASE_URL`）：
 
@@ -147,22 +209,28 @@ pip install -r requirements.txt
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8001 &
 DATABASE_URL=postgresql://... uvicorn app.main:app --port 8002 &
 python3 scripts/demo.py
+python3 scripts/test_publication_aggregation.py
+python3 scripts/test_publication_api.py http://127.0.0.1:8001 http://127.0.0.1:8002
 DATABASE_URL=postgresql://... python3 scripts/test_pit_sql.py
 DATABASE_URL=postgresql://... python3 scripts/lease_failover_test.py \
     http://127.0.0.1:8001 http://127.0.0.1:8002 postgresql://... 40
 ```
 
-## 六、API 一览
+## 七、API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/imports/applications` | 整批事务导入申请，重复 ID 全拒绝 |
 | POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝 |
-| POST | `/api/v1/batches` | 生成回填批次（固化受理时输入） |
+| POST | `/api/v1/batches` | 生成回填批次（固化受理时输入，每批至多 300 笔） |
 | GET | `/api/v1/batches` / `/api/v1/batches/{id}` | 批次状态 |
 | POST | `/api/v1/batches/{id}/resume` | FAILED 批次断点续算 |
-| GET | `/api/v1/batches/{id}/results?limit=&cursor=` | 完成后分页查询结果 |
+| GET | `/api/v1/batches/{id}/results?limit=&cursor=` | 完成后分页查询单笔回填结果 |
+| POST | `/api/v1/batches/{id}/publications` | 发布隐私收入分布（每批一版，并发先提交者为准） |
+| GET | `/api/v1/batches/{id}/publications?limit=&cursor=` | 分页查看已发布收入分布 |
+| GET | `/api/v1/publications` | 全部发布汇总 |
 | GET | `/api/v1/applications` / `/api/v1/events` | 已导入数据检查 |
 | GET | `/health` | 进程与 worker 身份 |
 
 所有时间字段必须带时区（ISO 8601，推荐 `...Z`），服务端统一转 UTC 存储。
+发布载荷只含聚合字段（收入箱、时间段、申请数、去重客户数），不含任何单笔申请或客户身份。

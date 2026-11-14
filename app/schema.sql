@@ -87,3 +87,33 @@ CREATE TABLE IF NOT EXISTS batch_results (
 );
 CREATE INDEX IF NOT EXISTS idx_batch_results_page
     ON batch_results (batch_id, item_seq);
+
+-- Privacy-preserving income-distribution publications ------------------------
+-- Exactly one publication per completed batch (UNIQUE batch_id is the hard
+-- concurrency backstop; the API also takes a FOR UPDATE row lock on batches).
+CREATE TABLE IF NOT EXISTS publications (
+    publication_id              UUID PRIMARY KEY,
+    batch_id                    UUID NOT NULL UNIQUE REFERENCES batches (batch_id),
+    k                           INTEGER NOT NULL CHECK (k BETWEEN 2 AND 5),
+    bin_width                   INTEGER NOT NULL CHECK (bin_width > 0),
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    row_count                   INTEGER NOT NULL DEFAULT 0,
+    suppressed_application_count INTEGER NOT NULL DEFAULT 0
+);
+
+-- One published, k-anonymous aggregate row. No application or customer id is
+-- ever stored here; distinct_customer_count is always >= the requested k.
+CREATE TABLE IF NOT EXISTS publication_rows (
+    publication_id            UUID NOT NULL REFERENCES publications (publication_id),
+    row_seq                   BIGINT NOT NULL,
+    period_kind               TEXT NOT NULL CHECK (period_kind IN ('MONTH', 'QUARTER', 'YEAR')),
+    period_start              DATE NOT NULL,  -- first UTC day of the period (inclusive)
+    period_end                DATE NOT NULL,  -- first UTC day after the period (exclusive)
+    bin_lower                 BIGINT,         -- NULL marks the separate empty-income bin
+    bin_upper                 BIGINT,         -- NULL marks the separate empty-income bin
+    application_count         INTEGER NOT NULL CHECK (application_count >= 0),
+    distinct_customer_count   INTEGER NOT NULL CHECK (distinct_customer_count >= 2),
+    PRIMARY KEY (publication_id, row_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_publication_rows_page
+    ON publication_rows (publication_id, row_seq);
